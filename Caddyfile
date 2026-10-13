@@ -1,0 +1,6 @@
+# HTTPS in front of gunicorn. Caddy gets and renews the certificate itself;
+# DOMAIN comes from .env and must already point at this server's IP.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy backend:8000
+}

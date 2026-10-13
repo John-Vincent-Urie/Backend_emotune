@@ -1,13 +1,11 @@
 # syntax=docker/dockerfile:1
 #
-# EmoTune backend. Build from the repository root, not from backend/: the
-# settings read docs/music.md from the project root, so the build context has to
-# include it. docker-compose.yml at the root does this for you.
+# EmoTune backend. Build context is this repository's root:
 #
-#   docker compose up --build
+#   docker compose -f docker-compose.prod.yml up --build -d
 #
-# The trained emotion models are not baked in (the served one alone is 11GB
-# with its checkpoints); compose mounts backend/ml/models read-only instead.
+# The trained emotion model is not baked in; it is a release asset (see
+# README.md) and docker-compose.prod.yml mounts ml/models read-only instead.
 
 FROM python:3.12-slim
 
@@ -28,13 +26,12 @@ WORKDIR /app/backend
 # PyPI wheel drags in several GB of CUDA libraries this backend never uses.
 # requirements.txt then sees torch as already satisfied.
 ARG TORCH_VERSION=2.13.0
-COPY backend/requirements.txt .
+COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}" \
     && pip install -r requirements.txt
 
-COPY docs/music.md /app/docs/music.md
-COPY backend/ .
+COPY . .
 
 # Collected at build time so the image serves the admin's CSS/JS (through
 # WhiteNoise) without a writable code directory.

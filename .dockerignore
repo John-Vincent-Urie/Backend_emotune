@@ -1,0 +1,17 @@
+# Never into the image: git, secrets, local state, and the model weights,
+# which docker-compose.prod.yml mounts at runtime instead.
+.git/
+**/.env
+**/.env.*
+venv/
+.venv/
+db.sqlite3
+.coverage
+staticfiles/
+media/
+logs/
+ml/models/
+*.tar.gz
+*.tar.gz.sha256
+**/__pycache__/
+**/*.pyc

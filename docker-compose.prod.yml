@@ -1,0 +1,102 @@
+# EmoTune backend on a single server (e.g. AWS EC2), behind Caddy for HTTPS.
+#
+#   cp .env.prod.example .env      # then fill it in
+#   docker compose -f docker-compose.prod.yml up --build -d
+#   docker compose -f docker-compose.prod.yml exec backend python manage.py createsuperuser
+#   docker compose -f docker-compose.prod.yml logs -f backend
+#
+# Only Caddy is published (80/443). gunicorn and MySQL are reachable from
+# inside this compose network only; there is no phpMyAdmin.
+
+services:
+  backend:
+    build: .
+    image: emotune-backend
+    env_file: .env
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_DB_ENGINE: mysql
+      MYSQL_HOST: db
+      MYSQL_PORT: "3306"
+      # Caddy is the one proxy in front: it terminates TLS and sets
+      # X-Forwarded-Proto/-For, so Django may trust exactly one hop.
+      DJANGO_TRUST_PROXY_SSL_HEADER: "true"
+      DRF_NUM_PROXIES: "1"
+      # Load the models when gunicorn starts rather than on the first request.
+      EMOTUNE_WARM_MODELS_ON_STARTUP: always
+      # The GoEmotions fallback is downloaded from Hugging Face on first start
+      # and kept in the hf-cache volume afterwards.
+      EMOTION_GOEMOTIONS_LOCAL_ONLY: ${EMOTION_GOEMOTIONS_LOCAL_ONLY:-false}
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "8000"
+    volumes:
+      - emotune-data:/data
+      # The served model, extracted from the GitHub release (see README.md).
+      - ./ml/models:/app/backend/ml/models:ro
+      - hf-cache:/home/app/.cache/huggingface
+    healthcheck:
+      # Any answer below 500 means Django is up. Not followed: with DEBUG off
+      # the SSL redirect alone would otherwise fail the check.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import http.client,sys; c=http.client.HTTPConnection('127.0.0.1',8000,timeout=4); c.request('GET','/django-admin/login/',headers={'Host':'localhost'}); sys.exit(c.getresponse().status>=500)"
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    restart: unless-stopped
+
+  db:
+    image: mysql:8.4
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=256M
+      - --performance-schema=OFF
+      - --max-connections=40
+    mem_limit: 768m
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-emotune}
+      MYSQL_USER: ${MYSQL_USER:-emotune}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
+      TZ: Asia/Manila
+    volumes:
+      - emotune-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u\"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  # Uploaded profile pictures.
+  emotune-data:
+  emotune-mysql:
+  hf-cache:
+  # Caddy's TLS certificates; keep it so restarts don't re-request them.
+  caddy-data:
+  caddy-config:
