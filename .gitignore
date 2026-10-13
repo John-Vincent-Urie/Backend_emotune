@@ -1,0 +1,28 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.coverage
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Local database
+db.sqlite3
+
+# Output of manage.py collectstatic
+staticfiles/
+
+# Trained models and checkpoints
+ml/models/bert_emotion_model/
+ml/models/bert_emotion_model_*/
+*.safetensors
+*.pt
+*.bin
+test-reports/
