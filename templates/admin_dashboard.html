@@ -1,0 +1,171 @@
+﻿{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EmoTune Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{% static 'api/admin_dashboard.css' %}">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+
+</head>
+<body>
+
+{% comment %}
+The page is already staff-gated by admin_panel, so the dashboard reads its API
+token from here instead of asking for credentials a second time. ({# #} comments
+must fit on one line; a multi-line one renders as text and, with body as a flex
+row, pushes the whole dashboard right.)
+{% endcomment %}
+{{ admin_access_token|json_script:"admin-access-token" }}
+
+<!-- APP -->
+<div id="app" class="app-shell">
+  <aside class="sidebar">
+    <div class="logo-area">
+      <div class="logo-circle">
+        <div class="logo-wave"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+      </div>
+      <div class="logo-name">EmoTune</div>
+      <div class="logo-sub">Admin Panel</div>
+    </div>
+    <nav>
+      <div class="nav-section">Main</div>
+      <div class="nav-item active" onclick="showPage('dashboard',this)"><span class="nav-icon">📊</span> Dashboard</div>
+      <div class="nav-item" onclick="showPage('users',this)"><span class="nav-icon">👥</span> Users</div>
+      <div class="nav-section nav-section-spaced">Analytics</div>
+      <div class="nav-item" onclick="showPage('moods',this)"><span class="nav-icon">🎭</span> Mood Analytics</div>
+      <div class="nav-item" onclick="showPage('playlists',this)"><span class="nav-icon">🎵</span> Playlists</div>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="admin-badge">
+        <div class="admin-avatar">A</div>
+        <div class="admin-info"><div class="admin-name" id="admin-username">{{ request.user.username }}</div><div class="admin-role">Super Admin</div></div>
+        <form method="post" action="{% url 'admin:logout' %}" class="logout-form">{% csrf_token %}<button type="submit" class="logout-icon" title="Logout">⏻</button></form>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div class="page-title" id="topbar-title">Admin <span>Dashboard</span></div>
+      <div class="topbar-right">
+        <div class="live-status"><div class="live-dot"></div> Live</div>
+        <button class="refresh-btn" onclick="loadDashboard()">↻ Refresh</button>
+      </div>
+    </div>
+    <div class="content">
+
+      <!-- DASHBOARD PAGE -->
+      <div class="page active" id="page-dashboard">
+        <div class="stats-grid">
+          <div class="stat-card stat-card-lime">
+            <div class="stat-label">Total Users</div>
+            <div class="stat-value stat-value-lime" id="stat-total">—</div>
+            <div class="stat-change" id="stat-total-change">Loading...</div>
+            <div class="stat-icon">👤</div>
+          </div>
+          <div class="stat-card stat-card-teal">
+            <div class="stat-label">Spotify Connected</div>
+            <div class="stat-value stat-value-teal" id="stat-spotify">—</div>
+            <div class="stat-change" id="stat-spotify-change">Loading...</div>
+            <div class="stat-icon">🎵</div>
+          </div>
+          <div class="stat-card stat-card-blue">
+            <div class="stat-label">Total Prompts</div>
+            <div class="stat-value stat-value-blue" id="stat-prompts">—</div>
+            <div class="stat-change">All time</div>
+            <div class="stat-icon">💬</div>
+          </div>
+          <div class="stat-card stat-card-orange">
+            <div class="stat-label">Top Mood</div>
+            <div class="stat-value stat-value-orange stat-value-small" id="stat-top-mood">—</div>
+            <div class="stat-change stat-change-muted" id="stat-top-mood-count">Loading...</div>
+            <div class="stat-icon">😊</div>
+          </div>
+        </div>
+        <div class="charts-grid">
+          <div class="chart-card">
+            <div class="chart-header"><div class="chart-title">Monthly Playlists Generated</div><div class="chart-badge">Last 6 months</div></div>
+            <div class="chart-container"><canvas id="monthlyChart"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-header"><div class="chart-title">Mood Distribution</div><div class="chart-badge">All time</div></div>
+            <div class="chart-container"><canvas id="moodPieChart"></canvas></div>
+          </div>
+        </div>
+        <div class="bottom-grid">
+          <div class="chart-card">
+            <div class="chart-header"><div class="chart-title">Top Moods Ranking</div></div>
+            <div class="mood-list" id="mood-bars"></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-header"><div class="chart-title">Recent Users</div></div>
+            <div id="recent-activity" class="recent-activity"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- USERS PAGE -->
+      <div class="page" id="page-users">
+        <div class="section-header">
+          <div class="section-title">User Management</div>
+          <div class="search-bar"><span class="search-icon">🔍</span><input type="text" id="user-search" placeholder="Search users..." oninput="filterUsers(this.value)"></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>User</th><th>Joined</th><th>Prompts</th><th>Spotify</th><th>Actions</th></tr></thead>
+            <tbody id="users-tbody"><tr><td colspan="5" class="table-empty">Loading users...</td></tr></tbody>
+          </table>
+          <div class="pagination"><span id="users-count">— users</span><div class="page-btns" id="page-btns"></div></div>
+        </div>
+      </div>
+
+      <!-- MOODS PAGE -->
+      <div class="page" id="page-moods">
+        <div class="section-header"><div class="section-title">Mood Analytics</div></div>
+        <div class="mood-analytics-grid">
+          <div class="chart-card"><div class="chart-header"><div class="chart-title">Mood Frequency</div></div><div class="chart-container"><canvas id="moodBarChart"></canvas></div></div>
+          <div class="chart-card"><div class="chart-header"><div class="chart-title">Mood Breakdown</div></div><div class="chart-container"><canvas id="moodDonutChart"></canvas></div></div>
+        </div>
+        <div class="chart-card"><div class="chart-header"><div class="chart-title">All Moods Detail</div></div><div id="mood-detail-list" class="mood-detail-list"></div></div>
+      </div>
+
+      <!-- PLAYLISTS PAGE -->
+      <div class="page" id="page-playlists">
+        <div class="section-header"><div class="section-title">Playlist Statistics</div></div>
+        <div class="chart-card chart-card-spaced">
+          <div class="chart-header"><div class="chart-title">Playlists Per Month</div><div class="chart-badge">Trend</div></div>
+          <div class="playlist-trend-container"><canvas id="playlistTrendChart"></canvas></div>
+        </div>
+        <div class="playlist-stats-grid">
+          <div class="stat-card stat-card-purple"><div class="stat-label">This Month</div><div class="stat-value stat-value-purple" id="pl-this-month">—</div><div class="stat-icon">📅</div></div>
+          <div class="stat-card stat-card-blue"><div class="stat-label">Last Month</div><div class="stat-value stat-value-blue" id="pl-last-month">—</div><div class="stat-icon">📆</div></div>
+          <div class="stat-card stat-card-lime"><div class="stat-label">Total All Time</div><div class="stat-value stat-value-lime" id="pl-total">—</div><div class="stat-icon">🎵</div></div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+</div>
+
+<!-- Delete Modal -->
+<div class="modal-overlay" id="delete-modal">
+  <div class="modal">
+    <div class="modal-icon">🗑️</div>
+    <div class="modal-title">Delete Account</div>
+    <div class="modal-text" id="modal-text">Are you sure? This cannot be undone.</div>
+    <div class="modal-btns">
+      <button class="btn-cancel" onclick="closeModal()">Cancel</button>
+      <button class="btn-delete" onclick="confirmDelete()">Delete</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="{% static 'api/admin_dashboard.js' %}"></script>
+</body>
+</html>
+
+

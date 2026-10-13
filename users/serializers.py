@@ -1,0 +1,196 @@
+from rest_framework import serializers
+from django.contrib.auth import get_user_model
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils import timezone
+from rest_framework_simplejwt.exceptions import InvalidToken
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
+from rest_framework_simplejwt.settings import api_settings as jwt_settings
+from api.models import emotion_display_names
+
+from .models import FavoriteTrack, PromptHistory
+
+User = get_user_model()
+
+
+class UserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = [
+            'id',
+            'username',
+            'email',
+            'profile_picture',
+            'bio',
+            'is_spotify_connected',
+            'is_staff',
+            'is_superuser',
+            'terms_accepted_at',
+            'created_at',
+        ]
+        read_only_fields = [
+            'id',
+            'created_at',
+            'is_spotify_connected',
+            'is_staff',
+            'is_superuser',
+            'terms_accepted_at',
+        ]
+
+
+def _check_password_strength(password, field, user):
+    """Run AUTH_PASSWORD_VALIDATORS (8+ characters, not common, not only digits,
+    not like the user's own details), reporting under `field` as DRF does.
+
+    Register, change-password and reset all go through this, so none of them
+    can set a password the others would refuse.
+    """
+    try:
+        validate_password(password, user=user)
+    except DjangoValidationError as error:
+        raise serializers.ValidationError({field: list(error.messages)})
+
+
+class RegisterSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(write_only=True)
+    confirm_password = serializers.CharField(write_only=True)
+    accept_terms = serializers.BooleanField(write_only=True)
+
+    class Meta:
+        model = User
+        fields = [
+            'username',
+            'email',
+            'password',
+            'confirm_password',
+            'accept_terms',
+        ]
+
+    def validate(self, data):
+        data['username'] = str(data.get('username') or '').strip()
+        data['email'] = str(data.get('email') or '').strip().lower()
+        if not data['username']:
+            raise serializers.ValidationError({'username': 'Display name is required.'})
+        # The field's own unique check ran on the address as typed, before the
+        # lowercasing above, so "Avery@Example.com" slipped past it and hit the
+        # database constraint as a 500.
+        if User.objects.filter(email__iexact=data['email']).exists():
+            raise serializers.ValidationError({'email': 'An account with this email already exists.'})
+        if not data['accept_terms']:
+            raise serializers.ValidationError({
+                'accept_terms': 'You must agree to the Terms and Privacy Policy.',
+            })
+        if data['password'] != data['confirm_password']:
+            raise serializers.ValidationError("Passwords do not match.")
+        # An unsaved user, so "too similar" compares against what was typed.
+        _check_password_strength(
+            data['password'], 'password', User(username=data['username'], email=data['email']),
+        )
+        return data
+
+    def create(self, validated_data):
+        validated_data.pop('confirm_password')
+        validated_data.pop('accept_terms')
+        user = User.objects.create_user(
+            username=validated_data['username'],
+            email=validated_data['email'],
+            password=validated_data['password'],
+            terms_accepted_at=timezone.now(),
+        )
+        return user
+
+
+class ActiveUserTokenRefreshSerializer(TokenRefreshSerializer):
+    """Refresh that refuses accounts that were deactivated or deleted.
+
+    simplejwt 5.3 never looks the user up on refresh, so a disabled account kept
+    getting fresh access tokens that every other endpoint then rejected: the app
+    retried forever instead of reaching its normal session-expired -> login path.
+    A 401 here (InvalidToken, like any dead refresh token) gets it there.
+    """
+
+    def validate(self, attrs):
+        # An invalid or expired token raises TokenError, which the view already
+        # turns into a 401.
+        user_id = self.token_class(attrs['refresh']).payload.get(jwt_settings.USER_ID_CLAIM)
+        if not User.objects.filter(**{jwt_settings.USER_ID_FIELD: user_id, 'is_active': True}).exists():
+            raise InvalidToken('No active account found for this token.')
+        return super().validate(attrs)
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """Expects the signed-in user in context['user'] for the similarity check."""
+
+    old_password = serializers.CharField(required=True)
+    new_password = serializers.CharField(required=True)
+    confirm_new_password = serializers.CharField(required=True)
+
+    def validate(self, data):
+        if data['new_password'] != data['confirm_new_password']:
+            raise serializers.ValidationError("New passwords do not match.")
+        _check_password_strength(data['new_password'], 'new_password', self.context.get('user'))
+        return data
+
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+    def validate_email(self, value):
+        return str(value or '').strip().lower()
+
+
+class PasswordResetVerifySerializer(PasswordResetRequestSerializer):
+    code = serializers.CharField(min_length=1)
+
+    def validate_code(self, value):
+        return str(value or '').strip()
+
+
+class PasswordResetConfirmSerializer(PasswordResetVerifySerializer):
+    # Same rules as registration, so a reset cannot be used to sneak past them.
+    new_password = serializers.CharField()
+    confirm_new_password = serializers.CharField()
+
+    def validate(self, data):
+        if data['new_password'] != data['confirm_new_password']:
+            raise serializers.ValidationError("New passwords do not match.")
+        # Compared with the address typed, never the stored account: a "too
+        # similar" error that only appeared for real accounts would tell anyone
+        # which emails are registered.
+        _check_password_strength(data['new_password'], 'new_password', User(email=data['email']))
+        return data
+
+
+def _display_name(serializer, emotion):
+    # Looked up once per response: the context is shared by every item of a list.
+    names = serializer.context.setdefault('emotion_display_names', None)
+    if names is None:
+        names = serializer.context['emotion_display_names'] = emotion_display_names()
+    return names.get(emotion)
+
+
+class FavoriteTrackSerializer(serializers.ModelSerializer):
+    emotion_display = serializers.SerializerMethodField()
+
+    def get_emotion_display(self, obj):
+        return _display_name(self, obj.emotion)
+
+    class Meta:
+        model = FavoriteTrack
+        fields = '__all__'
+        # `emotion` is set by the view from the request, which normalizes an
+        # unknown value to "untagged" instead of rejecting the favorite.
+        read_only_fields = ['user', 'added_at', 'emotion']
+
+
+class PromptHistorySerializer(serializers.ModelSerializer):
+    detected_emotion_display = serializers.SerializerMethodField()
+
+    def get_detected_emotion_display(self, obj):
+        return _display_name(self, obj.detected_emotion)
+
+    class Meta:
+        model = PromptHistory
+        fields = '__all__'
+        read_only_fields = ['user', 'created_at']
+
