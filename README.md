@@ -25,3 +25,15 @@ docker compose -f docker-compose.prod.yml exec backend python manage.py createsu
 
 The admin is then at `https://<DOMAIN>/django-admin/`. Point the app at it by
 building the APK with `--dart-define=API_BASE_URL=https://<DOMAIN>/api`.
+
+## Running locally with Docker
+
+`docker-compose.yml` is the development setup: the backend on
+http://127.0.0.1:8000, MySQL on 127.0.0.1:3307 and phpMyAdmin on
+http://127.0.0.1:8081.
+
+```bash
+cp .env.example .env           # set MYSQL_PASSWORD at least
+# extract the model release into ml/models/ as above
+docker compose up --build -d
+```
