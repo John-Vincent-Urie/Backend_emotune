@@ -171,7 +171,7 @@ class AnalyzeInputStatusTests(APITestCase):
         self.assertEqual(body['emotion'], 'sad')
         self.assertEqual(body['prediction_source'], 'emotion_word')
         self.assertEqual(body['confidence'], 100.0)
-        self.assertEqual(body['total'], 9)
+        self.assertEqual(body['total'], 10)
         self.assertTrue(PromptHistory.objects.filter(user=self.user).exists())
 
     @patch('api.views.get_classifier')
@@ -189,7 +189,7 @@ class AnalyzeInputStatusTests(APITestCase):
         self.assertEqual(body['input_status'], 'ok')
         self.assertEqual(body['input_route'], 'model')
         self.assertEqual(body['emotion'], 'sad')
-        self.assertEqual(body['total'], 9)
+        self.assertEqual(body['total'], 10)
 
     @patch('api.views.get_classifier')
     def test_crisis_language_still_wins_even_in_tagalog(self, mock_classifier):

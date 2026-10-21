@@ -708,8 +708,8 @@ class AnalyzeEmotionTests(TestCase):
         self.assertEqual(body['emotion'], 'depressing')
         self.assertEqual(body['emotion_info']['display_name'], 'Depressed')
         self.assertEqual([t['name'] for t in body['tracks']], _approved_titles('depressing'))
-        self.assertEqual(body['total'], 9)
-        self.assertEqual([t['position'] for t in body['tracks']], list(range(1, 10)))
+        self.assertEqual(body['total'], 10)
+        self.assertEqual([t['position'] for t in body['tracks']], list(range(1, 11)))
         self.assertTrue(all(t['recommendation_source'] == 'therapist_list' for t in body['tracks']))
         # Owner correction 2026-10-10: no longer approved for Depressed.
         self.assertNotIn('Innocence', [t['name'] for t in body['tracks']])
@@ -793,7 +793,7 @@ class AnalyzeEmotionTests(TestCase):
             ).json()
 
         self.assertEqual(body['emotion'], 'mixed')
-        self.assertEqual(body['total'], 6)
+        self.assertEqual(body['total'], 10)
 
     def test_blank_or_overlong_text_is_rejected(self):
         for text in ('', '   ', 'x' * 2001):
