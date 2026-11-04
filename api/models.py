@@ -103,6 +103,48 @@ class EmotionSong(models.Model):
         return f"{self.emotion.name} #{self.position}: {self.song}"
 
 
+class EmotionPair(models.Model):
+    """A named mix of two emotions felt at once, e.g. "Bittersweet" for happy +
+    sad. The pair is unordered and stored with `emotion_a` first by name, so
+    happy + sad and sad + happy are the same row. The names come from the
+    mixed-emotion literature (docs/PREDICTION_PIPELINE.md, section 4b) and the
+    pairs are listed under MIXED in docs/music.md."""
+
+    name = models.CharField(max_length=50, unique=True)
+    display_name = models.CharField(max_length=50)
+    emotion_a = models.ForeignKey(Emotion, on_delete=models.CASCADE, related_name='pairs_a')
+    emotion_b = models.ForeignKey(Emotion, on_delete=models.CASCADE, related_name='pairs_b')
+    songs = models.ManyToManyField(Song, through='EmotionPairSong', related_name='emotion_pairs')
+
+    class Meta:
+        db_table = 'emotion_pairs'
+        ordering = ['name']
+        constraints = [
+            models.UniqueConstraint(fields=['emotion_a', 'emotion_b'], name='unique_emotion_pair'),
+        ]
+
+    def __str__(self):
+        return f"{self.display_name} ({self.emotion_a.name} + {self.emotion_b.name})"
+
+
+class EmotionPairSong(models.Model):
+    """A therapist-approved song for a named emotion pair, in list order."""
+
+    pair = models.ForeignKey(EmotionPair, on_delete=models.CASCADE, related_name='song_links')
+    song = models.ForeignKey(Song, on_delete=models.CASCADE, related_name='pair_links')
+    position = models.PositiveIntegerField()
+
+    class Meta:
+        db_table = 'emotion_pair_songs'
+        ordering = ['pair', 'position']
+        constraints = [
+            models.UniqueConstraint(fields=['pair', 'song'], name='unique_emotion_pair_song'),
+        ]
+
+    def __str__(self):
+        return f"{self.pair.name} #{self.position}: {self.song}"
+
+
 def emotion_display_names():
     """{label: therapist display name}, e.g. 'motivational' -> 'Motivated'."""
     return dict(Emotion.objects.values_list('name', 'display_name'))
@@ -119,6 +161,52 @@ def songs_for_emotion(emotion_name):
         .order_by('position', 'song_id')
     )
     return emotion, [link.song.as_track(link.position) for link in links]
+
+
+def songs_for_all_mixes():
+    """Every named mix's songs, mix by mix, for the Mixed tab (team decision,
+    2026-10-30: MIXED is split into the named mixes). Each track says which
+    mix it is for in `emotion_pair`; `position` is its place in this list."""
+    tracks = []
+    pairs = EmotionPair.objects.select_related('emotion_a', 'emotion_b').order_by('id')
+    for pair in pairs:
+        links = (
+            pair.song_links.filter(song__is_active=True)
+            .select_related('song')
+            .order_by('position', 'song_id')
+        )
+        for link in links:
+            tracks.append({
+                **link.song.as_track(len(tracks) + 1),
+                'emotion_pair': {
+                    'name': pair.name,
+                    'display_name': pair.display_name,
+                    'emotions': [pair.emotion_a.name, pair.emotion_b.name],
+                },
+            })
+    return tracks
+
+
+def songs_for_emotion_pair(first_name, second_name):
+    """(first Emotion, second Emotion, EmotionPair or None, its songs) for a
+    user who feels two things at once ("happy + sad" is Bittersweet). The pair
+    is unordered. With no named pair, or no songs for it yet, the pair is None
+    and the list empty; the caller then serves the first emotion's own list."""
+    first = Emotion.objects.filter(name=first_name).first()
+    second = Emotion.objects.filter(name=second_name).first()
+    if first is None or second is None or first == second:
+        return first, second, None, []
+    low, high = sorted((first, second), key=lambda emotion: emotion.name)
+    pair = EmotionPair.objects.filter(emotion_a=low, emotion_b=high).first()
+    if pair is None:
+        return first, second, None, []
+    links = (
+        pair.song_links.filter(song__is_active=True)
+        .select_related('song')
+        .order_by('position', 'song_id')
+    )
+    tracks = [link.song.as_track(link.position) for link in links]
+    return first, second, (pair if tracks else None), tracks
 
 
 class SupportResource(models.Model):

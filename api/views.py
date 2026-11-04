@@ -43,7 +43,10 @@ from .session_plan import (
 from ml.emotion_classifier import EMOTIONS, get_classifier, get_ai_response
 from ml.plutchik_mapper import build_plutchik_profile
 from users.models import PromptHistory
-from .models import Emotion, SupportEvent, SupportResource, emotion_display_names, songs_for_emotion
+from .models import (
+    Emotion, SupportEvent, SupportResource, emotion_display_names, songs_for_emotion,
+    songs_for_all_mixes, songs_for_emotion_pair,
+)
 from .safety import (
     CONCERN_CHECK_IN_MESSAGE,
     SOMEONE_ELSE_CHECK_IN_MESSAGE,
@@ -63,13 +66,16 @@ logger = logging.getLogger(__name__)
 
 RECOVERY_TRIGGER_EMOTIONS = frozenset({'sad', 'stressed', 'depressing', 'angry'})
 RECOVERY_SUPPORT_EMOTION_MAP = {
-    'sad': 'calm',
+    'sad': 'happy',
+    # Stress shifts toward calm, not happy: iso-principle listening after an
+    # anxiety induction was studied as a shift to calmness (Lowe-Brown et al.,
+    # 2026, Musicae Scientiae, doi:10.1177/10298649261421187).
     'stressed': 'calm',
-    'depressing': 'calm',
+    'depressing': 'happy',
     'angry': 'motivational',
 }
 RECOVERY_TRIGGER_CONFIDENCE = 0.90
-RECOVERY_CHECK_INTERVAL_TRACKS = 5
+RECOVERY_CHECK_INTERVAL_TRACKS = 3
 # The refactor plan asks for a reasonable maximum on the analysed text.
 MAX_ANALYZE_TEXT_LENGTH = 2000
 
@@ -157,6 +163,9 @@ def _build_crisis_response_payload(severity=SEVERITY_CRISIS, subject='self'):
         'all_scores': all_scores,
         'top_emotions': [],
         'secondary_emotion': None,
+        'detected_emotions': [],
+        'is_two_emotions': False,
+        'emotion_pair': None,
         'plutchik_scores': {},
         'plutchik_top_emotions': [],
         'plutchik_dominant_emotion': None,
@@ -435,7 +444,27 @@ def _build_emotion_response_payload(
         )
     recovery_plan = _build_recovery_plan(result=result, existing_plan=recovery_plan)
 
-    emotion_record, tracks = songs_for_emotion(emotion)
+    second_emotion = result.get('second_emotion')
+    second_record = None
+    emotion_pair = None
+    tracks = []
+    if second_emotion and second_emotion != emotion:
+        # Two feelings get only the therapist's songs for that named pair
+        # ("Bittersweet" for happy + sad).
+        emotion_record, second_record, emotion_pair, tracks = songs_for_emotion_pair(
+            emotion, second_emotion,
+        )
+    if emotion_pair is None:
+        # One feeling, or a pair with no name or songs yet: the first
+        # emotion's own list.
+        second_record = None
+        emotion_record, tracks = songs_for_emotion(emotion)
+        if emotion == 'mixed':
+            # MIXED is split into the named mixes: its tab lists every mix's
+            # songs, each labelled with its mix.
+            tracks = songs_for_all_mixes()
+    if second_record is None:
+        second_emotion = None
     ai_response = get_ai_response(emotion)
 
     user = request.user if request.user.is_authenticated else None
@@ -449,6 +478,8 @@ def _build_emotion_response_payload(
                 else None
             ),
             'song_source': 'therapist_list',
+            'second_emotion': second_emotion,
+            'emotion_pair': emotion_pair.name if emotion_pair else None,
         }
         try:
             history = (
@@ -510,6 +541,19 @@ def _build_emotion_response_payload(
         ],
         'secondary_emotion': result.get('secondary_emotion'),
         'secondary_emotion_display': display_names.get(result.get('secondary_emotion')),
+        # The feelings the songs are for: one, or two when the user feels both
+        # ("happy and sad"). The app shows them and can narrow to one.
+        'detected_emotions': [
+            {'emotion': record.name, 'display_name': record.display_name}
+            for record in (emotion_record, second_record)
+            if record is not None
+        ],
+        'is_two_emotions': second_record is not None,
+        'emotion_pair': (
+            {'name': emotion_pair.name, 'display_name': emotion_pair.display_name}
+            if emotion_pair
+            else None
+        ),
         'plutchik_scores': {
             name: round(float(score) * 100, 1) for name, score in plutchik_scores.items()
         },
@@ -571,6 +615,9 @@ def _build_clarify_payload(input_status):
         'top_emotions': [],
         'secondary_emotion': None,
         'secondary_emotion_display': None,
+        'detected_emotions': [],
+        'is_two_emotions': False,
+        'emotion_pair': None,
         'plutchik_scores': {},
         'plutchik_top_emotions': [],
         'plutchik_dominant_emotion': None,
@@ -595,13 +642,25 @@ def _build_clarify_payload(input_status):
     }
 
 
-def _build_emotion_word_result(emotion):
-    """The user named the emotion ("sad", "i'm so stressed"): take it as said."""
-    return {
+def _build_emotion_word_result(emotion, second_emotion=None):
+    """The user named the emotion ("sad", "i'm so stressed"), or two ("sad and
+    lonely"): take it as said."""
+    result = {
         **_build_explicit_emotion_result(emotion),
         'prediction_source': 'emotion_word',
         'prediction_strategy': 'emotion_word_shortcut',
     }
+    if second_emotion in EMOTIONS and second_emotion != result['emotion']:
+        # Both were said outright, so both are certain.
+        result['all_scores'][second_emotion] = 1.0
+        result['confidence_margin'] = 0.0
+        result['top_emotions'] = [
+            {'emotion': result['emotion'], 'confidence': 1.0},
+            {'emotion': second_emotion, 'confidence': 1.0},
+        ]
+        result['secondary_emotion'] = second_emotion
+        result['second_emotion'] = second_emotion
+    return result
 
 
 def _build_explicit_emotion_result(emotion):
@@ -666,9 +725,13 @@ def analyze_emotion(request):
     check_in_frequency_tracks = _request_check_in_frequency_tracks(request)
 
     if decision.route == ROUTE_EMOTION_WORD:
-        result = _build_emotion_word_result(decision.emotion)
+        result = _build_emotion_word_result(decision.emotion, decision.second_emotion)
     else:
-        result = decision.result
+        result = {
+            **decision.result,
+            'emotion': decision.emotion or decision.result.get('emotion'),
+            'second_emotion': decision.second_emotion,
+        }
 
     payload = _build_emotion_response_payload(
         request,
@@ -791,9 +854,10 @@ def check_feel_better(request):
                 music_picker_data['session_plan'] = session_plan
                 response_payload['session_plan'] = session_plan
                 response_payload['next_checkpoint_tracks'] = session_plan.get('next_check_in_tracks')
-                response_payload['check_interval_tracks'] = max(
-                    _safe_int(session_plan.get('check_in_after_tracks'), RECOVERY_CHECK_INTERVAL_TRACKS),
-                    1,
+                response_payload['check_interval_tracks'] = (
+                    max(_safe_int(session_plan.get('check_in_after_tracks'), 1), 1)
+                    if session_plan.get('check_in_after_tracks')
+                    else None
                 )
             if recovery_plan:
                 recovery_plan['tracks_played'] = max(
@@ -822,7 +886,7 @@ def check_feel_better(request):
                     ),
                     'recovery_plan': recovery_plan,
                 })
-                if session_plan:
+                if session_plan and session_plan.get('check_in_after_tracks'):
                     # The session's cadence is what the student chose; report its
                     # interval, and whichever checkpoint comes first so the app
                     # calls back in time for both prompts.
@@ -850,6 +914,7 @@ def check_feel_better(request):
             if (
                 not response_payload['should_prompt']
                 and session_plan
+                and session_plan.get('next_check_in_tracks')
                 and not session_plan.get('completed')
                 and tracks_played >= max(
                     _safe_int(session_plan.get('next_check_in_tracks'), 0),
@@ -925,7 +990,12 @@ def feel_better_response(request):
             session_plan['next_check_in_tracks'] = None
         else:
             session_plan['completed'] = False
-            session_plan['next_check_in_tracks'] = tracks_played + interval
+            # A mode without check-ins (match_mood) must not gain one here.
+            session_plan['next_check_in_tracks'] = (
+                tracks_played + interval
+                if session_plan.get('check_in_after_tracks')
+                else None
+            )
         music_picker_data['session_plan'] = session_plan
 
         if not recovery_plan:
@@ -989,7 +1059,7 @@ def feel_better_response(request):
         return Response({
             'status': 'ok',
             'action': 'continue_playlist',
-            'message': 'Okay, I will check in again after 5 more songs.',
+            'message': f'Okay, I will check in again after {interval} more songs.',
             'history_id': history.id,
             'next_checkpoint_tracks': recovery_plan['next_checkpoint_tracks'],
             'check_interval_tracks': interval,
@@ -1365,6 +1435,7 @@ def spotify_player_control(request):
     position_ms = request.data.get('position_ms')
     shuffle_enabled = request.data.get('shuffle_enabled')
     repeat_mode = request.data.get('repeat_mode')
+    queue_uris = request.data.get('queue_uris')
     control_result = spotify_service.execute_playback_command(
         request.user,
         action=action,
@@ -1373,6 +1444,7 @@ def spotify_player_control(request):
         position_ms=position_ms,
         shuffle_enabled=shuffle_enabled,
         repeat_mode=repeat_mode,
+        queue_uris=queue_uris,
     )
     logger.info(
         "Spotify player control user=%s action=%s ok=%s blocking=%s device=%s",

@@ -1,11 +1,3 @@
-"""Remove three songs from one emotion each (therapist list update, 2026-10-21).
-
-ANGRY: Halaga (Parokya ni Edgar). LONELY: Weston Road Flows (Drake).
-ROMANTIC: All of Me (John Legend). Only the emotion link is removed; the Song
-rows stay, so history and favorites that point at them still work. The songs
-after each removed one move up, so positions stay 1..n. Undoing puts each song
-back at its old position. docs/music.md lists the same change.
-"""
 from django.db import migrations
 
 REMOVALS = [

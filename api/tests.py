@@ -505,7 +505,11 @@ class SpotifyOAuthTests(TestCase):
         client.force_authenticate(user=user)
         response = client.post(
             '/api/spotify/player-control/',
-            {'action': 'play', 'uri': 'spotify:track:track-1'},
+            {
+                'action': 'play',
+                'uri': 'spotify:track:track-1',
+                'queue_uris': ['spotify:track:track-2'],
+            },
             format='json',
         )
 
@@ -520,6 +524,7 @@ class SpotifyOAuthTests(TestCase):
             position_ms=None,
             shuffle_enabled=None,
             repeat_mode=None,
+            queue_uris=['spotify:track:track-2'],
         )
 
     @patch('api.views.spotify_service.execute_playback_command')
@@ -562,6 +567,7 @@ class SpotifyOAuthTests(TestCase):
             position_ms=45000,
             shuffle_enabled=True,
             repeat_mode='track',
+            queue_uris=None,
         )
 
     def test_disconnect_spotify_clears_linked_account_state(self):
@@ -756,9 +762,9 @@ class AnalyzeEmotionTests(TestCase):
                 self.assertEqual(names.count('Leaves'), 1)
 
     def test_an_emotion_with_no_songs_returns_an_empty_list_and_a_message(self):
-        EmotionSong.objects.filter(emotion__name='mixed').delete()
+        EmotionSong.objects.filter(emotion__name='calm').delete()
 
-        body = self._analyze('mixed').json()
+        body = self._analyze('calm').json()
 
         self.assertEqual((body['tracks'], body['total']), ([], 0))
         self.assertIn('message', body)
@@ -792,8 +798,10 @@ class AnalyzeEmotionTests(TestCase):
                 '/api/analyze/', {'text': 'I feel strange about everything today'}, format='json',
             ).json()
 
+        # MIXED is split into the named mixes, so this is every mix's songs.
         self.assertEqual(body['emotion'], 'mixed')
-        self.assertEqual(body['total'], 10)
+        self.assertEqual(body['total'], 25)
+        self.assertTrue(all(track['emotion_pair'] for track in body['tracks']))
 
     def test_blank_or_overlong_text_is_rejected(self):
         for text in ('', '   ', 'x' * 2001):
@@ -1413,6 +1421,67 @@ class SpotifyAuthPlaybackTests(TestCase):
             json_body={'uris': ['spotify:track:track-1']},
         )
 
+    def _play_body_for(self, username, uri, queue_uris):
+        user = User.objects.create_user(
+            username=username, email=f'{username}@example.com', password='password123',
+        )
+        preparation = {
+            'ok': True,
+            'blocking_issue': None,
+            'selected_device_id': 'device-1',
+            'selected_device_name': '2409BRN2CA',
+        }
+        diagnostics = {
+            'spotify_connected': True,
+            'token': {'is_valid': True},
+            'oauth': {'missing_required_scopes': []},
+            'account': {'has_premium': True},
+            'devices': {'has_active_device': True},
+        }
+        with patch.object(spotify_service, 'get_playback_debug_status', return_value=diagnostics), \
+                patch.object(spotify_service, 'ensure_valid_token', return_value='spotify-token'), \
+                patch.object(spotify_service, 'prepare_playback', return_value=preparation), \
+                patch.object(
+                    spotify_service, '_spotify_request', return_value={'ok': True, 'status_code': 204},
+                ) as mock_spotify_request, \
+                patch.object(spotify_service, '_spotify_get', return_value={'ok': True, 'data': {}}):
+            spotify_service.execute_playback_command(
+                user, action='play', uri=uri, queue_uris=queue_uris,
+            )
+        return mock_spotify_request.call_args.kwargs['json_body']
+
+    def test_play_queues_the_rest_of_the_emotune_list(self):
+        # A lone URI lets Spotify Autoplay pick the next song; the list keeps
+        # Spotify's queue to the therapist's songs.
+        body = self._play_body_for(
+            'play-queue-user',
+            'spotify:track:track-2',
+            ['spotify:track:track-3', 'spotify:track:track-4'],
+        )
+        self.assertEqual(
+            body,
+            {'uris': ['spotify:track:track-2', 'spotify:track:track-3', 'spotify:track:track-4']},
+        )
+
+    def test_play_queue_drops_non_tracks_duplicates_and_caps_at_fifty(self):
+        queue = (
+            ['spotify:track:track-1', 'spotify:album:x', '', None, 'https://open.spotify.com/track/y']
+            + [f'spotify:track:q{i}' for i in range(60)]
+        )
+        body = self._play_body_for('play-queue-clean-user', 'spotify:track:track-1', queue)
+        self.assertEqual(body['uris'][0], 'spotify:track:track-1')
+        self.assertEqual(len(body['uris']), 50)
+        self.assertEqual(body['uris'][1:3], ['spotify:track:q0', 'spotify:track:q1'])
+        self.assertTrue(all(uri.startswith('spotify:track:') for uri in body['uris']))
+
+    def test_play_ignores_a_queue_that_is_not_a_list(self):
+        body = self._play_body_for('play-queue-bad-user', 'spotify:track:track-1', 'spotify:track:x')
+        self.assertEqual(body, {'uris': ['spotify:track:track-1']})
+
+    def test_play_of_an_album_ignores_the_queue(self):
+        body = self._play_body_for('play-queue-album-user', 'spotify:album:a1', ['spotify:track:t'])
+        self.assertEqual(body, {'context_uri': 'spotify:album:a1'})
+
     def test_execute_playback_command_seeks_with_position_param(self):
         user = User.objects.create_user(
             username='seek-command-user',
@@ -1786,7 +1855,22 @@ class FeelBetterRecoveryTests(TestCase):
         payload.update(overrides)
         return PromptHistory.objects.create(**payload)
 
-    def test_check_feel_better_prompts_after_five_tracks_for_high_intensity_session(self):
+    def test_check_feel_better_waits_until_three_tracks(self):
+        history = self._create_history()
+
+        response = self.client.post(
+            '/api/feel-better/',
+            {'history_id': history.id, 'duration': 360, 'tracks_played': 2},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body['should_prompt'])
+        self.assertEqual(body['next_checkpoint_tracks'], 3)
+        self.assertEqual(body['check_interval_tracks'], 3)
+
+    def test_check_feel_better_prompts_after_three_tracks_for_high_intensity_session(self):
         history = self._create_history()
 
         response = self.client.post(
@@ -1794,7 +1878,7 @@ class FeelBetterRecoveryTests(TestCase):
             {
                 'history_id': history.id,
                 'duration': 930,
-                'tracks_played': 5,
+                'tracks_played': 3,
             },
             format='json',
         )
@@ -1802,15 +1886,19 @@ class FeelBetterRecoveryTests(TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertTrue(body['should_prompt'])
-        self.assertEqual(body['next_checkpoint_tracks'], 5)
+        self.assertEqual(
+            body['message'],
+            "You've listened to 3 songs. Are you feeling better right now?",
+        )
+        self.assertEqual(body['next_checkpoint_tracks'], 3)
         self.assertEqual(body['recovery_plan']['original_emotion'], 'sad')
-        self.assertEqual(body['recovery_plan']['support_emotion'], 'calm')
+        self.assertEqual(body['recovery_plan']['support_emotion'], 'happy')
 
         history.refresh_from_db()
         self.assertEqual(history.session_duration, 930)
         self.assertEqual(
             history.music_picker_data['recovery_plan']['tracks_played'],
-            5,
+            3,
         )
 
     def test_feel_better_response_not_yet_moves_checkpoint_forward(self):
@@ -1822,7 +1910,7 @@ class FeelBetterRecoveryTests(TestCase):
                 'history_id': history.id,
                 'felt_better': False,
                 'duration': 930,
-                'tracks_played': 5,
+                'tracks_played': 3,
             },
             format='json',
         )
@@ -1830,13 +1918,14 @@ class FeelBetterRecoveryTests(TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body['action'], 'continue_playlist')
-        self.assertEqual(body['next_checkpoint_tracks'], 10)
+        self.assertEqual(body['message'], 'Okay, I will check in again after 3 more songs.')
+        self.assertEqual(body['next_checkpoint_tracks'], 6)
 
         history.refresh_from_db()
         self.assertFalse(history.felt_better_response)
         self.assertEqual(
             history.music_picker_data['recovery_plan']['next_checkpoint_tracks'],
-            10,
+            6,
         )
         self.assertEqual(
             history.music_picker_data['recovery_plan']['not_yet_count'],
@@ -1884,15 +1973,15 @@ class FeelBetterRecoveryTests(TestCase):
 
         response = self.client.post(
             '/api/feel-better-response/',
-            {'history_id': history.id, 'felt_better': True, 'duration': 930, 'tracks_played': 5},
+            {'history_id': history.id, 'felt_better': True, 'duration': 930, 'tracks_played': 3},
             format='json',
         )
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body['action'], 'transition_playlist')
-        self.assertEqual(body['emotion'], 'calm')
-        self.assertEqual([t['name'] for t in body['tracks']], _approved_titles('calm'))
+        self.assertEqual(body['emotion'], 'happy')
+        self.assertEqual([t['name'] for t in body['tracks']], _approved_titles('happy'))
         self.assertEqual(body['total'], 10)
         self.assertTrue(body['recovery_plan']['transition_applied'])
 
@@ -1900,3 +1989,26 @@ class FeelBetterRecoveryTests(TestCase):
         self.assertTrue(history.felt_better_response)
         self.assertEqual(history.playlist_data, body['tracks'])
         self.assertTrue(history.music_picker_data['recovery_plan']['transition_applied'])
+
+    def test_feel_better_switch_targets(self):
+        """Sad and depressing lift to happy, stressed settles to calm, angry goes to motivational."""
+        for original, support in (
+            ('sad', 'happy'),
+            ('stressed', 'calm'),
+            ('depressing', 'happy'),
+            ('angry', 'motivational'),
+        ):
+            with self.subTest(original=original):
+                history = self._create_history(
+                    detected_emotion=original,
+                    emotion_scores={original: 0.95, 'mixed': 0.05},
+                )
+                response = self.client.post(
+                    '/api/feel-better-response/',
+                    {'history_id': history.id, 'felt_better': True, 'duration': 930, 'tracks_played': 3},
+                    format='json',
+                )
+                body = response.json()
+                self.assertEqual(body['action'], 'transition_playlist')
+                self.assertEqual(body['recovery_plan']['support_emotion'], support)
+                self.assertEqual(body['emotion'], support)

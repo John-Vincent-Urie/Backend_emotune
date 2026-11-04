@@ -20,6 +20,27 @@ from .utils import (
 
 logger = logging.getLogger('api.spotify_service')
 
+# Spotify's play endpoint takes at most this many track URIs in one call.
+MAX_PLAY_URIS = 50
+
+
+def _play_uris(uri, queue_uris):
+    """The track to play first, then the rest of EmoTune's list.
+
+    A lone URI leaves Spotify nothing queued, so when it ends (or next is
+    pressed) Spotify Autoplay starts its own pick, which is not on the
+    therapist list. Sending the list keeps Spotify's queue to our songs.
+    """
+    uris = [uri]
+    if isinstance(queue_uris, (list, tuple)):
+        for item in queue_uris:
+            item = str(item or '').strip()
+            if item.startswith('spotify:track:') and item not in uris:
+                uris.append(item)
+            if len(uris) >= MAX_PLAY_URIS:
+                break
+    return uris
+
 
 class SpotifyPlaybackClient:
     def __init__(self, service):
@@ -518,6 +539,7 @@ class SpotifyPlaybackClient:
         position_ms=None,
         shuffle_enabled=None,
         repeat_mode=None,
+        queue_uris=None,
     ):
         """Control Spotify playback through the Web API on the user's active device."""
         normalized_action = str(action or '').strip().lower()
@@ -654,11 +676,12 @@ class SpotifyPlaybackClient:
 
             item_parts = normalized_uri.split(':', 2)
             item_type = item_parts[1] if len(item_parts) >= 2 else 'track'
-            play_body = (
-                {'uris': [normalized_uri]}
-                if item_type in {'track', 'episode'}
-                else {'context_uri': normalized_uri}
-            )
+            if item_type == 'track':
+                play_body = {'uris': _play_uris(normalized_uri, queue_uris)}
+            elif item_type == 'episode':
+                play_body = {'uris': [normalized_uri]}
+            else:
+                play_body = {'context_uri': normalized_uri}
             command_result = self.service._spotify_request(
                 'PUT',
                 token,

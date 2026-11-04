@@ -14,6 +14,9 @@ from typing import Dict, List, Optional
 from .emotion_labels import (
     EMOTIONS,
     GOEMOTIONS_LABEL_MAP,
+    MIX_LABEL_EMOTIONS,
+    MIX_LABELS,
+    MIX_MODEL_LABELS,
     call_huggingface_loader as _call_huggingface_loader,
 )
 from .plutchik_mapper import build_plutchik_profile
@@ -465,6 +468,12 @@ class EmotionClassifier:
                     return None
                 ordered_labels.append(canonical_label)
 
+            if set(ordered_labels) == set(MIX_MODEL_LABELS) and len(ordered_labels) == len(
+                MIX_MODEL_LABELS
+            ):
+                # A model trained on the mix schema (12 emotions + 5 named mixes).
+                return ordered_labels
+
             if len(ordered_labels) != len(EMOTIONS):
                 return None
 
@@ -778,9 +787,12 @@ class EmotionClassifier:
         return distribution
 
     def _rank_scores(self, scores: Dict[str, float]) -> List[dict]:
+        # A mix-schema model also scores the five named mixes; they compete
+        # with the single emotions for the top spot.
+        labels = list(EMOTIONS) + [label for label in MIX_LABELS if label in scores]
         ranking = [
-            {'emotion': emotion, 'confidence': float(scores.get(emotion, 0.0))}
-            for emotion in EMOTIONS
+            {'emotion': label, 'confidence': float(scores.get(label, 0.0))}
+            for label in labels
         ]
         ranking.sort(key=lambda item: (-item['confidence'], item['emotion']))
         return ranking
@@ -814,14 +826,31 @@ class EmotionClassifier:
             top_prediction['confidence'],
             confidence_margin,
         )
-        top_emotions = ranking[:self.top_emotions_count]
+        # The app works in single emotions. A predicted named mix ("bittersweet")
+        # becomes its two emotions, and `mix_label` says which mix it was.
+        mix_label = top_prediction['emotion'] if top_prediction['emotion'] in MIX_LABEL_EMOTIONS else None
+        single_scores = {emotion: float(scores.get(emotion, 0.0)) for emotion in EMOTIONS}
+        if mix_label:
+            first, second = MIX_LABEL_EMOTIONS[mix_label]
+            emotion = first
+            top_emotions = [
+                {'emotion': first, 'confidence': top_prediction['confidence']},
+                {'emotion': second, 'confidence': top_prediction['confidence']},
+            ]
+        else:
+            emotion = top_prediction['emotion']
+            top_emotions = [
+                item for item in ranking if item['emotion'] not in MIX_LABEL_EMOTIONS
+            ][:self.top_emotions_count]
         secondary_emotion = top_emotions[1]['emotion'] if len(top_emotions) > 1 else None
-        plutchik_profile = build_plutchik_profile(scores)
+        plutchik_profile = build_plutchik_profile(single_scores)
 
         return {
-            'emotion': top_prediction['emotion'],
+            'emotion': emotion,
             'confidence': top_prediction['confidence'],
-            'all_scores': scores,
+            'all_scores': single_scores,
+            'mix_label': mix_label,
+            'mix_scores': {label: float(scores[label]) for label in MIX_LABELS if label in scores},
             'top_emotions': top_emotions,
             'secondary_emotion': secondary_emotion,
             'plutchik_scores': plutchik_profile['plutchik_scores'],
@@ -835,7 +864,7 @@ class EmotionClassifier:
             'fallback_used': bool(fallback_used),
             'fallback_reason': fallback_reason,
             'needs_review': bool(uncertain or confidence_band != 'high'),
-            'label_schema_version': 'v1',
+            'label_schema_version': 'mix' if any(label in scores for label in MIX_LABELS) else 'v1',
         }
 
     def _build_uncertain_result(

@@ -16,8 +16,10 @@ OUTCOME_MODE_CONFIG = {
         "label": "Match My Mood",
         "description": "Stay close to the emotion the classifier detected.",
         "default_session_minutes": 20,
-        "default_check_in_tracks": 5,
-        "check_in_prompt": "Is this session matching how you want to feel right now?",
+        # No "is this helping?" check-ins: only the Calm Me Down emotions are
+        # asked (user decision). The session length still tracks progress.
+        "default_check_in_tracks": None,
+        "check_in_prompt": None,
         "completion_message": "Session locked in. I will stop interrupting and let the music carry you.",
     },
     "calm_me_down": {
@@ -110,10 +112,14 @@ def build_session_plan(
     if target_minutes <= 0:
         return None
 
-    checkpoint_tracks = max(
-        _safe_int(check_in_frequency_tracks, _safe_int(config.get("default_check_in_tracks"), 4)),
-        1,
-    )
+    if config.get("default_check_in_tracks") is None:
+        # This mode never checks in, whatever cadence the caller asked for.
+        checkpoint_tracks = None
+    else:
+        checkpoint_tracks = max(
+            _safe_int(check_in_frequency_tracks, _safe_int(config.get("default_check_in_tracks"), 4)),
+            1,
+        )
     phase_cutoff = max(target_minutes // 3, 1)
 
     return {

@@ -1,0 +1,21 @@
+text,expected_pair,expected_emotions,category,split,source
+I'm happy I graduated but sad to leave my friends,bittersweet,happy|sad,mix,dev,seed
+it was my last day at school and I smiled but I also cried,bittersweet,happy|sad,mix,dev,seed
+my boyfriend broke up with me and I keep crying,romantic_melancholy,romantic|sad,mix,dev,seed
+I still love her but she is gone and it hurts,romantic_melancholy,romantic|sad,mix,dev,seed
+nobody texted me back and I cried all night,,lonely|sad,mixed_unnamed,dev,seed
+I eat lunch alone every day and it makes me feel down,,lonely|sad,mixed_unnamed,dev,seed
+our anniversary dinner felt so calm and peaceful,tender,calm|romantic,mix,dev,seed
+lying next to my partner listening to the rain feels so relaxing,tender,calm|romantic,mix,dev,seed
+looking at old photos from my childhood makes me smile,bittersweet_nostalgia,happy|nostalgic,mix,dev,seed
+we sang the songs from high school and I was so happy remembering those days,bittersweet_nostalgia,happy|nostalgic,mix,dev,seed
+so many deadlines this week but I won't give up,challenged,motivational|stressed,mix,dev,seed
+my thesis is due Friday and I'm stressed but determined to finish it,challenged,motivational|stressed,mix,dev,seed
+I failed my exam and I feel terrible about it,,sad,single,dev,seed
+I just got promoted and I can't stop smiling,,happy,single,dev,seed
+I'm so nervous about my job interview tomorrow,,fear,single,dev,seed
+someone stole my bike and I'm furious,,angry,single,dev,seed
+I'm angry at him but also scared of what he will do,,angry|fear,mixed_unnamed,dev,seed
+I'm excited for the trip but nervous about flying,,happy|fear,mixed_unnamed,dev,seed
+I'm not happy at all I'm just sad,,sad,negated,dev,seed
+I don't miss him and I feel happy today,,happy,negated,dev,seed

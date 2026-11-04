@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import SupportEvent, SupportResource
+from .models import EmotionPair, EmotionPairSong, SupportEvent, SupportResource
 
 
 @admin.register(SupportResource)
@@ -23,3 +23,15 @@ class SupportEventAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+
+class EmotionPairSongInline(admin.TabularInline):
+    model = EmotionPairSong
+    extra = 0
+
+
+@admin.register(EmotionPair)
+class EmotionPairAdmin(admin.ModelAdmin):
+    """Store each pair with emotion A first by name (happy before sad)."""
+    list_display = ('display_name', 'name', 'emotion_a', 'emotion_b')
+    inlines = [EmotionPairSongInline]

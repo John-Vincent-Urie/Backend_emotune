@@ -14,8 +14,13 @@ from api.input_validation import (
     STATUS_NON_ENGLISH,
     STATUS_OFF_TOPIC,
     STATUS_UNCLEAR,
+    STATUS_UNSUPPORTED_MIX,
     check_input,
+    decide_after_crisis,
     model_result_is_unclear,
+    named_pair_in_sentence,
+    second_model_emotion,
+    sentence_emotions,
 )
 from users.models import PromptHistory
 
@@ -65,9 +70,106 @@ class InputRuleTests(SimpleTestCase):
             check = check_input(text)
             self.assertEqual((check.route, check.emotion), ('emotion_word', emotion), text)
 
-    def test_negated_or_double_emotions_go_to_the_model(self):
-        for text in ('not happy', "i'm not sad", 'happy and sad'):
+    def test_negated_or_three_emotions_go_to_the_model(self):
+        for text in ('not happy', "i'm not sad", 'not sad and lonely', 'sad lonely angry'):
             self.assertIsNone(check_input(text).emotion, text)
+
+    def test_two_named_emotions_are_both_taken(self):
+        cases = {
+            'sad and lonely': ('sad', 'lonely'),
+            'happy but nervous': ('happy', 'fear'),
+            'i feel sad and lonely at the same time': ('sad', 'lonely'),
+            'stressed but motivated': ('stressed', 'motivational'),
+            'happy and sad': ('happy', 'sad'),
+        }
+        for text, (first, second) in cases.items():
+            check = check_input(text)
+            self.assertEqual(
+                (check.route, check.emotion, check.second_emotion),
+                ('emotion_word', first, second), text,
+            )
+    def test_a_mix_name_means_its_two_emotions(self):
+        cases = {
+            'bittersweet': ('happy', 'sad'), 'i feel so bittersweet': ('happy', 'sad'),
+            'heartache': ('romantic', 'sad'), 'romantic melancholy': ('romantic', 'sad'),
+            'bittersweet nostalgia': ('happy', 'nostalgic'),
+            'feeling tender': ('calm', 'romantic'), 'sentimental': ('happy', 'nostalgic'),
+            'challenged': ('motivational', 'stressed'),
+        }
+        for text, emotions in cases.items():
+            check = check_input(text)
+            self.assertEqual(check.route, 'emotion_word', text)
+            self.assertEqual((check.emotion, check.second_emotion), emotions, text)
+        # Two mixes, or a mix and another emotion, are more than two feelings.
+        self.assertIsNone(check_input('bittersweet and angry').emotion)
+
+    def test_a_sentence_names_its_mix_with_feeling_words_or_cues(self):
+        cases = {
+            "I'm happy I graduated but sad to leave my friends": ('happy', 'sad'),
+            "I'm glad it's over but I'm also kind of heartbroken": ('happy', 'sad'),
+            'it was my last day at school, I smiled but I also cried': ('happy', 'sad'),
+            'my boyfriend broke up with me and I keep crying': ('romantic', 'sad'),
+            'our anniversary dinner felt so calm and peaceful': ('romantic', 'calm'),
+            'looking at old photos from childhood makes me smile': ('nostalgic', 'happy'),
+            "so many deadlines this week but I won't give up": ('stressed', 'motivational'),
+        }
+        for text, pair in cases.items():
+            self.assertEqual(named_pair_in_sentence(text), pair, text)
+        # The model's emotion goes first when it is one of the two.
+        self.assertEqual(
+            named_pair_in_sentence('it was my last day at school, I smiled but I also cried', 'sad'),
+            ('sad', 'happy'),
+        )
+
+    def test_negation_cancels_only_the_word_it_is_next_to(self):
+        self.assertEqual(sentence_emotions("I'm not happy, just sad"), ['sad'])
+        self.assertEqual(sentence_emotions('I am not sad, I smiled all day'), ['happy'])
+        self.assertIsNone(named_pair_in_sentence("I'm not happy, just sad"))
+
+    def test_no_pair_or_two_pairs_in_a_sentence_is_no_mix(self):
+        self.assertIsNone(named_pair_in_sentence('the wedding made me sad that my lola was gone'))
+        # Sad + lonely is not a named mix (removed 2026-10-30).
+        self.assertIsNone(named_pair_in_sentence('nobody texted me and I cried all night'))
+        # happy + sad and happy + nostalgic: which one is meant is not clear.
+        self.assertIsNone(named_pair_in_sentence('happy and sad looking at my childhood photos'))
+
+    def test_the_sentence_mix_replaces_mixed_or_one_of_its_two(self):
+        text = "I'm happy I graduated but sad to leave my friends"
+        for model_emotion in ('mixed', 'sad', 'happy'):
+            decision = decide_after_crisis(text, lambda _t, e=model_emotion: _prediction(e, 0.84))
+            self.assertEqual(
+                sorted((decision.emotion, decision.second_emotion)), ['happy', 'sad'], model_emotion,
+            )
+        # A clear third reading is left alone.
+        decision = decide_after_crisis(text, lambda _t: _prediction('nostalgic', 0.9))
+        self.assertEqual((decision.emotion, decision.second_emotion), ('nostalgic', None))
+
+    def test_mixed_words_without_a_pair_stay_mixed(self):
+        for text in ('mixed feelings', 'conflicted', 'torn'):
+            check = check_input(text)
+            self.assertEqual((check.emotion, check.second_emotion), ('mixed', None), text)
+        # "Mixed" is already the blend; one emotion has no second.
+        self.assertEqual((check_input('mixed and sad').emotion, check_input('mixed and sad').second_emotion),
+                         ('mixed', None))
+        self.assertIsNone(check_input('sad').second_emotion)
+
+    def test_a_strong_runner_up_is_a_second_emotion(self):
+        def two(first, c1, second, c2):
+            result = _prediction(first, c1, margin=c1 - c2)
+            result['top_emotions'] = [
+                {'emotion': first, 'confidence': c1}, {'emotion': second, 'confidence': c2},
+            ]
+            return result
+        self.assertEqual(second_model_emotion(two('sad', 0.59, 'lonely', 0.30)), 'lonely')
+        self.assertIsNone(second_model_emotion(two('sad', 0.91, 'angry', 0.04)))
+        self.assertIsNone(second_model_emotion(two('mixed', 0.58, 'fear', 0.35)))
+        # A near tie of two strong emotions is two feelings, not "please clarify".
+        with_affect = check_input('I failed my exam and I feel terrible')
+        self.assertFalse(model_result_is_unclear(two('sad', 0.46, 'romantic', 0.42), with_affect))
+        # A near tie that is no named mix is still a guess.
+        self.assertTrue(model_result_is_unclear(two('sad', 0.46, 'lonely', 0.42), with_affect))
+        # ...unless one side is "mixed", which has no second list to blend.
+        self.assertTrue(model_result_is_unclear(two('mixed', 0.46, 'sad', 0.42), with_affect))
 
     def test_questions_commands_and_facts_are_off_topic(self):
         for text in ('what is 2+2', 'play something for coding', 'the weather is nice',
@@ -173,6 +275,148 @@ class AnalyzeInputStatusTests(APITestCase):
         self.assertEqual(body['confidence'], 100.0)
         self.assertEqual(body['total'], 10)
         self.assertTrue(PromptHistory.objects.filter(user=self.user).exists())
+
+    @patch('api.views.get_classifier')
+    def test_two_named_emotions_get_only_the_songs_for_that_pair(self, mock_classifier):
+        for text in ('happy and sad', 'sad but happy', 'bittersweet'):
+            body = self._analyze(text).json()
+
+            self.assertTrue(body['is_two_emotions'], text)
+            self.assertEqual(
+                sorted(e['emotion'] for e in body['detected_emotions']), ['happy', 'sad'], text,
+            )
+            self.assertEqual(
+                [(t['name'], t['artist']) for t in body['tracks']],
+                [
+                    ('The Day You Said Goodnight', 'Hale'),
+                    ('Married Life', 'Michael Giacchino'),
+                    ('Kathang Isip', 'Ben&Ben'),
+                    ('Multo', 'Cup of Joe'),
+                    ('Lifetime', 'Ben&Ben'),
+                ], text,
+            )
+            self.assertEqual(body['total'], 5)
+            self.assertEqual(
+                body['emotion_pair'], {'name': 'bittersweet', 'display_name': 'Bittersweet'}, text,
+            )
+        mock_classifier.assert_not_called()
+        history = PromptHistory.objects.filter(user=self.user).latest('id')
+        self.assertEqual(history.music_picker_data['emotion_pair'], 'bittersweet')
+
+    @patch('api.views.get_classifier')
+    def test_a_strong_model_runner_up_gets_the_pair_songs(self, mock_classifier):
+        result = _prediction('sad', 0.59, margin=0.29)
+        result['top_emotions'] = [
+            {'emotion': 'sad', 'confidence': 0.59}, {'emotion': 'romantic', 'confidence': 0.30},
+        ]
+        mock_classifier.return_value.predict.return_value = result
+
+        body = self._analyze('I miss her so much since she left').json()
+
+        self.assertEqual(body['input_route'], 'model')
+        self.assertTrue(body['is_two_emotions'])
+        self.assertEqual([e['emotion'] for e in body['detected_emotions']], ['sad', 'romantic'])
+        self.assertEqual(
+            [t['name'] for t in body['tracks']],
+            ['Somebody Else', 'bittersweet', 'The Night We Met', 'Say You Love Me', 'Happier'],
+        )
+        self.assertEqual(body['emotion_pair']['display_name'], 'Romantic Melancholy')
+
+    @patch('api.views.get_classifier')
+    def test_two_named_feelings_that_are_no_mix_are_not_supported(self, mock_classifier):
+        # Sad + lonely stopped being a mix on 2026-10-30.
+        for text in ('sad and lonely', 'angry and scared', 'happy but nervous'):
+            self._assert_clarify(self._analyze(text), STATUS_UNSUPPORTED_MIX)
+        mock_classifier.assert_not_called()
+
+    @patch('api.views.get_classifier')
+    def test_a_sentence_naming_an_unsupported_mix_says_so(self, mock_classifier):
+        mock_classifier.return_value.predict.return_value = _prediction('angry', 0.8)
+
+        self._assert_clarify(
+            self._analyze("I'm angry at him but also scared of what he will do"),
+            STATUS_UNSUPPORTED_MIX,
+        )
+
+    @patch('api.views.get_classifier')
+    def test_an_old_model_mixed_reading_without_a_named_mix_is_not_supported(self, mock_classifier):
+        mock_classifier.return_value.predict.return_value = _prediction('mixed', 0.83)
+
+        self._assert_clarify(
+            self._analyze('I feel strange about moving to a new city next month'),
+            STATUS_UNSUPPORTED_MIX,
+        )
+
+    @patch('api.views.get_classifier')
+    def test_cues_alone_are_not_an_unsupported_mix(self, mock_classifier):
+        # "nobody" and "cried" are clues, not feelings named outright.
+        mock_classifier.return_value.predict.return_value = _prediction('sad', 0.98)
+
+        body = self._analyze('nobody texted me back and I cried all night').json()
+
+        self.assertEqual(body['input_status'], 'ok')
+        self.assertEqual(body['emotion'], 'sad')
+        self.assertEqual(body['total'], 10)
+
+    @patch('api.views.get_classifier')
+    def test_a_mixed_sentence_gets_its_named_mix_songs(self, mock_classifier):
+        mock_classifier.return_value.predict.return_value = _prediction('mixed', 0.84)
+
+        body = self._analyze("I'm happy I graduated but sad to leave my friends").json()
+
+        self.assertEqual(body['emotion_pair']['name'], 'bittersweet')
+        self.assertEqual(body['emotion'], 'happy')
+        self.assertEqual(
+            [t['name'] for t in body['tracks']],
+            ['The Day You Said Goodnight', 'Married Life', 'Kathang Isip', 'Multo', 'Lifetime'],
+        )
+
+    @patch('api.views.get_classifier')
+    def test_one_clear_feeling_keeps_its_full_list(self, mock_classifier):
+        mock_classifier.return_value.predict.return_value = _prediction('sad', 0.92)
+
+        body = self._analyze('I failed my exam and I feel terrible about it').json()
+
+        self.assertFalse(body['is_two_emotions'])
+        self.assertEqual([e['emotion'] for e in body['detected_emotions']], ['sad'])
+
+    def test_the_mixed_tab_lists_every_mix_song_with_its_mix(self):
+        body = self.client.post(
+            '/api/recommend-by-emotion/', {'emotion': 'mixed'}, format='json',
+        ).json()
+
+        # Five songs per mix, mix by mix, each labelled with its mix.
+        self.assertEqual(
+            [(t['name'], t['emotion_pair']['display_name']) for t in body['tracks']],
+            [
+                ('The Day You Said Goodnight', 'Bittersweet'),
+                ('Married Life', 'Bittersweet'),
+                ('Kathang Isip', 'Bittersweet'),
+                ('Multo', 'Bittersweet'),
+                ('Lifetime', 'Bittersweet'),
+                ('Somebody Else', 'Romantic Melancholy'),
+                ('bittersweet', 'Romantic Melancholy'),
+                ('The Night We Met', 'Romantic Melancholy'),
+                ('Say You Love Me', 'Romantic Melancholy'),
+                ('Happier', 'Romantic Melancholy'),
+                ('Palagi', 'Tender'),
+                ('Pasilyo', 'Tender'),
+                ('Tahanan', 'Tender'),
+                ('Mahika', 'Tender'),
+                ('Tadhana', 'Tender'),
+                ('The Nights', 'Bittersweet Nostalgia'),
+                ('Castle on the Hill', 'Bittersweet Nostalgia'),
+                ('Kabisado', 'Bittersweet Nostalgia'),
+                ('1990', 'Bittersweet Nostalgia'),
+                ('With a Smile', 'Bittersweet Nostalgia'),
+                ('Whatever It Takes', 'Challenged'),
+                ('Karera', 'Challenged'),
+                ('The Climb', 'Challenged'),
+                ('Unstoppable', 'Challenged'),
+                ('Hall of Fame', 'Challenged'),
+            ],
+        )
+        self.assertEqual([t['position'] for t in body['tracks']], list(range(1, 26)))
 
     @patch('api.views.get_classifier')
     def test_an_unsure_model_answer_asks_to_clarify(self, mock_classifier):

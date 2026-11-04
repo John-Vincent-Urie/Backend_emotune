@@ -34,8 +34,10 @@ class SessionLengthUnitTests(APITestCase):
             self.assertEqual(plan['target_minutes'], minutes)
             self.assertEqual(plan['target_seconds'], minutes * 60)
             self.assertEqual(plan['mode'], 'match_mood')
-            # Auto check-in falls back to the mode default (5 for match_mood)
-            self.assertEqual(plan['check_in_after_tracks'], 5)
+            # Match My Mood never checks in; only the length is tracked.
+            self.assertIsNone(plan['check_in_after_tracks'])
+            self.assertIsNone(plan['next_check_in_tracks'])
+            self.assertIsNone(plan['check_in_prompt'])
             self.assertEqual(plan['phase'], 'settle')
             self.assertFalse(plan['completed'])
 
@@ -50,13 +52,22 @@ class SessionLengthUnitTests(APITestCase):
             build_session_plan(outcome_mode='match_mood', session_length_minutes=0)
         )
 
-    def test_check_in_override_is_honoured(self):
+    def test_check_in_override_is_honoured_for_calm_me_down(self):
+        plan = build_session_plan(
+            outcome_mode='calm_me_down',
+            session_length_minutes=15,
+            check_in_frequency_tracks=4,
+        )
+        self.assertEqual(plan['check_in_after_tracks'], 4)
+
+    def test_match_mood_ignores_a_check_in_override(self):
         plan = build_session_plan(
             outcome_mode='match_mood',
             session_length_minutes=15,
             check_in_frequency_tracks=3,
         )
-        self.assertEqual(plan['check_in_after_tracks'], 3)
+        self.assertIsNone(plan['check_in_after_tracks'])
+        self.assertIsNone(plan['next_check_in_tracks'])
 
     def test_progress_moves_through_phases(self):
         plan = build_session_plan(
@@ -146,30 +157,33 @@ class SessionLengthApiTests(APITestCase):
         ).json()
         self.assertFalse(early['should_prompt'])
         self.assertEqual(early['session_plan']['progress_seconds'], 120)
-        self.assertEqual(early['check_interval_tracks'], 3)
+        self.assertIsNone(early['check_interval_tracks'])
+        self.assertIsNone(early['next_checkpoint_tracks'])
 
-        at_checkpoint = self.client.post(
+        # Calm is Match My Mood: progress is tracked but it never asks.
+        at_three = self.client.post(
             '/api/feel-better/',
             {'history_id': history_id, 'duration': 6 * 60, 'tracks_played': 3},
             format='json',
         ).json()
-        self.assertTrue(at_checkpoint['should_prompt'])
-        self.assertEqual(at_checkpoint['session_plan']['phase'], 'support')
+        self.assertFalse(at_three['should_prompt'])
+        self.assertEqual(at_three['session_plan']['phase'], 'support')
 
         at_target = self.client.post(
             '/api/feel-better/',
             {'history_id': history_id, 'duration': 15 * 60, 'tracks_played': 6},
             format='json',
         ).json()
+        self.assertFalse(at_target['should_prompt'])
         self.assertEqual(at_target['session_plan']['phase'], 'close')
         self.assertEqual(at_target['session_plan']['progress_seconds'], 900)
 
     @patch('api.views.get_classifier')
     def test_session_cadence_wins_over_the_recovery_interval(self, mock_classifier):
-        # A high-confidence stressed reading starts a recovery plan (every 5
-        # tracks) and calm_me_down's session plan (every 3). The app schedules
+        # A high-confidence stressed reading starts a recovery plan and
+        # calm_me_down's session plan, both every 3 tracks. The app schedules
         # its next call from next_checkpoint_tracks, so both fields must follow
-        # the session, which comes first.
+        # the session's cadence.
         mock_classifier.return_value.predict.return_value = {
             **PREDICTION,
             'emotion': 'stressed', 'confidence': 0.97,
@@ -193,6 +207,52 @@ class SessionLengthApiTests(APITestCase):
         self.assertFalse(early['should_prompt'])
         self.assertEqual(early['check_interval_tracks'], 3)
         self.assertEqual(early['next_checkpoint_tracks'], 3)
+
+    def test_match_mood_emotions_never_get_a_check_in(self):
+        """Only sad, stressed, depressing and angry are asked "is this helping?"."""
+        for emotion in ('happy', 'calm', 'romantic', 'nostalgic', 'motivational', 'surprising', 'mixed'):
+            with self.subTest(emotion=emotion):
+                body = self.client.post(
+                    '/api/recommend-by-emotion/',
+                    {'emotion': emotion, 'session_length_minutes': 30},
+                    format='json',
+                ).json()
+                self.assertEqual(body['outcome_mode'], 'match_mood')
+                for tracks in (3, 5, 10):
+                    check = self.client.post(
+                        '/api/feel-better/',
+                        {'history_id': body['history_id'], 'duration': tracks * 180, 'tracks_played': tracks},
+                        format='json',
+                    ).json()
+                    self.assertFalse(check['should_prompt'], tracks)
+                    self.assertIsNone(check['next_checkpoint_tracks'], tracks)
+
+                # A stray "not yet" must not arm a check-in either.
+                answer = self.client.post(
+                    '/api/feel-better-response/',
+                    {'history_id': body['history_id'], 'felt_better': False, 'tracks_played': 10},
+                    format='json',
+                ).json()
+                self.assertIsNone(answer['next_checkpoint_tracks'])
+                later = self.client.post(
+                    '/api/feel-better/',
+                    {'history_id': body['history_id'], 'duration': 20 * 180, 'tracks_played': 20},
+                    format='json',
+                ).json()
+                self.assertFalse(later['should_prompt'])
+
+    def test_explicit_calm_me_down_still_checks_in(self):
+        body = self.client.post(
+            '/api/recommend-by-emotion/',
+            {'emotion': 'happy', 'session_length_minutes': 30, 'outcome_mode': 'calm_me_down'},
+            format='json',
+        ).json()
+        check = self.client.post(
+            '/api/feel-better/',
+            {'history_id': body['history_id'], 'duration': 540, 'tracks_played': 3},
+            format='json',
+        ).json()
+        self.assertTrue(check['should_prompt'])
 
     def test_non_numeric_history_id_is_a_bad_request(self):
         for path in ('/api/feel-better/', '/api/feel-better-response/', '/api/users/listen-time/'):

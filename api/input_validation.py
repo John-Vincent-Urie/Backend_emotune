@@ -5,6 +5,7 @@
 1. gibberish    -- keyboard mash or no real words        -> ask again, no songs
 2. non English  -- Tagalog or Taglish ("pagod na ako")  -> ask for English
 3. emotion word -- "sad", "i'm so stressed", "😭"        -> that emotion, no BERT
+                  "happy and sad" names two             -> that mix's songs
 4. off topic    -- questions, commands, facts, no self  -> ask again, no songs
 5. vague        -- "meh", "idk", "fine"                  -> ask to clarify
 6. otherwise BERT runs, and `model_result_is_unclear` rejects a low-confidence
@@ -26,12 +27,19 @@ STATUS_GIBBERISH = 'gibberish'
 STATUS_OFF_TOPIC = 'off_topic'
 STATUS_UNCLEAR = 'unclear'
 STATUS_NON_ENGLISH = 'non_english'
+# Two feelings named together that are not one of the five named mixes
+# ("angry and scared"). Team decision 2026-10-30: say so instead of guessing.
+STATUS_UNSUPPORTED_MIX = 'unsupported_mix'
 
 CLARIFY_MESSAGES = {
     STATUS_GIBBERISH: "I couldn't understand that. Please tell me how you are feeling right now.",
     STATUS_OFF_TOPIC: 'Tell me how you are feeling right now.',
     STATUS_UNCLEAR: 'Please clarify what you feel right now.',
     STATUS_NON_ENGLISH: 'Please describe how you feel in English.',
+    STATUS_UNSUPPORTED_MIX: (
+        "Sorry, EmoTune doesn't support this mix of emotions yet. "
+        "Please tell me the feeling that's strongest right now."
+    ),
 }
 
 ROUTE_EMOTION_WORD = 'emotion_word'
@@ -96,14 +104,80 @@ EMOTION_WORDS_EN = {
         'affectionate', 'loved up', 'crushing',
     ),
     'nostalgic': (
-        'nostalgic', 'sentimental', 'homesick', 'reminiscing', 'wistful',
+        'nostalgic', 'homesick', 'reminiscing', 'wistful',
         'nostalgia',
     ),
     'mixed': (
-        'mixed', 'mixed feelings', 'conflicted', 'torn', 'bittersweet',
+        'mixed', 'mixed feelings', 'conflicted', 'torn',
         'all over the place', 'confused',
     ),
 }
+
+# Words that name a mix of two emotions felt at once, keyed by the pair (the
+# EmotionPair rows of migration 0016). "Bittersweet" is happy + sad, so it is
+# not in MIXED or NOSTALGIC above. The names and their sources are in
+# docs/PREDICTION_PIPELINE.md, section 4b.
+EMOTION_PAIR_WORDS_EN = {
+    ('happy', 'sad'): ('bittersweet',),
+    ('romantic', 'sad'): ('romantic melancholy', 'heartache', 'heartachy'),
+    ('calm', 'romantic'): ('tender',),
+    ('happy', 'nostalgic'): ('bittersweet nostalgia', 'sentimental'),
+    ('motivational', 'stressed'): ('challenged', 'eustress'),
+}
+
+
+# Clues to an emotion inside a longer sentence ("I smiled but I also cried").
+# Used only to find which two emotions a mixed sentence names, never alone to
+# pick one emotion, so everyday words that lean one way are fine here.
+EMOTION_CUES_EN = {
+    'happy': (
+        'smile', 'smiled', 'smiling', 'laugh', 'laughed', 'laughing', 'proud',
+        'grateful', 'thankful', 'blessed', 'excited', 'relieved', 'graduated',
+        'promoted', 'celebrate', 'celebrated', 'celebrating', 'yay', 'hooray',
+    ),
+    'sad': (
+        'cry', 'cried', 'tears', 'sob', 'sobbing', 'miss', 'missed', 'missing',
+        'grieving', 'grief', 'goodbye', 'goodbyes', 'hurts', 'hurting',
+        'broke my heart',
+    ),
+    'lonely': (
+        'nobody', 'no one', 'by myself', 'on my own', 'no friends', 'no one to talk to',
+    ),
+    'romantic': (
+        'crush', 'boyfriend', 'girlfriend', 'bf', 'gf', 'partner', 'anniversary',
+        'my love', 'love of my life', 'kissed',
+    ),
+    'calm': ('cozy', 'comfortable', 'safe', 'unwind', 'breathe'),
+    'nostalgic': (
+        'memories', 'memory', 'childhood', 'old days', 'back then', 'used to',
+        'throwback', 'old photos', 'old pictures', 'the good old days',
+    ),
+    'stressed': (
+        'deadline', 'deadlines', 'pressure', 'exam', 'exams', 'thesis', 'homework',
+        'workload', 'cramming', 'too much work', 'so much work',
+    ),
+    'motivational': (
+        'ready', 'keep going', 'push through', "won't give up", 'wont give up',
+        'never give up', 'not giving up', 'i can do this', 'i got this', 'grind',
+        'work hard', 'hustle',
+    ),
+}
+
+# Clues that name a whole mix: a breakup is sadness about love.
+EMOTION_PAIR_CUES_EN = {
+    ('romantic', 'sad'): ('broke up', 'breakup', 'break up', 'dumped', 'heartbreak'),
+}
+
+
+def _emotion_phrases():
+    """Every (phrase, emotions) the word rules know; a pair word names two."""
+    for emotion, phrases in EMOTION_WORDS_EN.items():
+        for phrase in phrases:
+            yield phrase, (emotion,)
+    for emotions, phrases in EMOTION_PAIR_WORDS_EN.items():
+        for phrase in phrases:
+            yield phrase, emotions
+
 
 # Emoji are language-neutral, so they are not part of the Tagalog hold.
 EMOTION_EMOJI = {
@@ -292,14 +366,14 @@ class InputCheck:
     emotion: str | None = None
     route: str | None = None
     has_affect: bool = True
+    second_emotion: str | None = None
 
 
 @lru_cache(maxsize=1)
 def known_words():
     words = set(KNOWN_WORDS_PATH.read_text(encoding='utf-8').split())
-    for phrases in EMOTION_WORDS_EN.values():
-        for phrase in phrases:
-            words.update(phrase.split())
+    for phrase, _emotions in _emotion_phrases():
+        words.update(phrase.split())
     words.update(FILLER_WORDS_EN, VAGUE_WORDS_EN, AFFECT_CUES_EN, FIRST_PERSON_EN)
     # Tagalog is a real language, not a keyboard mash: known here so it reaches
     # the non-English check instead of being called gibberish.
@@ -309,12 +383,8 @@ def known_words():
 
 @lru_cache(maxsize=1)
 def _emotion_phrase_index():
-    """(phrase tokens, emotion) pairs, longest first so 'in love' beats 'love'."""
-    pairs = [
-        (tuple(phrase.split()), emotion)
-        for emotion, phrases in EMOTION_WORDS_EN.items()
-        for phrase in phrases
-    ]
+    """(phrase tokens, emotions) pairs, longest first so 'in love' beats 'love'."""
+    pairs = [(tuple(phrase.split()), emotions) for phrase, emotions in _emotion_phrases()]
     return tuple(sorted(pairs, key=lambda pair: -len(pair[0])))
 
 
@@ -323,8 +393,7 @@ def _affect_vocabulary():
     """(single words, multi-word phrases) that make a sentence about feelings:
     our emotion words, the cues above, and the classifier's own keyword lists."""
     entries = set(AFFECT_CUES_EN)
-    for phrases in EMOTION_WORDS_EN.values():
-        entries.update(phrases)
+    entries.update(phrase for phrase, _emotions in _emotion_phrases())
     for keywords in EMOTION_KEYWORDS.values():
         entries.update(keyword.replace('-', ' ') for keyword in keywords)
     words = frozenset(
@@ -411,32 +480,135 @@ def _is_gibberish(text, tokens):
     return known / len(tokens) < 0.5
 
 
+# Words that may join two emotion words: "happy but nervous", "sad and lonely
+# at the same time".
+BLEND_JOINERS_EN = frozenset(('but', 'also', 'yet', 'both', 'plus', 'at', 'same', 'time', 'while'))
+
+
 def _match_emotion_word(tokens):
     """The single emotion a short input names, or None."""
-    if not tokens or len(tokens) > 6:
+    emotions = _match_emotion_words(tokens)
+    return emotions[0] if emotions and len(emotions) == 1 else None
+
+
+def _match_emotion_words(tokens):
+    """The one or two emotions a short input names, in the order written, or
+    None. "Mixed" plus another emotion is just mixed: that list is the blend."""
+    if not tokens or len(tokens) > 9:
         return None
     vocabulary = known_words()
     normalized = [_normalize_token(token, vocabulary) or token for token in tokens]
     if any(token in NEGATION_WORDS_EN for token in normalized):
         return None
-    found = set()
+    found = []
     remaining = list(normalized)
     index = 0
     leftovers = []
     while index < len(remaining):
-        for phrase, emotion in _emotion_phrase_index():
+        for phrase, emotions in _emotion_phrase_index():
             if tuple(remaining[index:index + len(phrase)]) == phrase:
-                found.add(emotion)
+                for emotion in emotions:
+                    if emotion not in found:
+                        found.append(emotion)
                 index += len(phrase)
                 break
         else:
             leftovers.append(remaining[index])
             index += 1
-    if len(found) != 1:
+    if not found or len(found) > 2:
         return None
-    if any(token not in FILLER_WORDS_EN for token in leftovers):
+    if len(found) == 1 and len(tokens) > 6:
         return None
-    return found.pop()
+    allowed = FILLER_WORDS_EN | BLEND_JOINERS_EN if len(found) == 2 else FILLER_WORDS_EN
+    if any(token not in allowed for token in leftovers):
+        return None
+    if 'mixed' in found:
+        return ('mixed',)
+    return tuple(found)
+
+
+@lru_cache(maxsize=1)
+def _sentence_phrase_index(with_cues=True):
+    """(phrase tokens, emotions) for finding emotions anywhere in a sentence:
+    the emotion words (minus everyday ones like "good" or "down"), the mix
+    names and, unless `with_cues` is false, the cues above. Longest first."""
+    entries = []
+    for phrase, emotions in _emotion_phrases():
+        if phrase not in AMBIGUOUS_AFFECT_WORDS:
+            entries.append((tuple(phrase.split()), emotions))
+    if with_cues:
+        for emotion, phrases in EMOTION_CUES_EN.items():
+            entries.extend((tuple(phrase.split()), (emotion,)) for phrase in phrases)
+        for emotions, phrases in EMOTION_PAIR_CUES_EN.items():
+            entries.extend((tuple(phrase.split()), emotions) for phrase in phrases)
+    return tuple(sorted(entries, key=lambda entry: -len(entry[0])))
+
+
+# A negation this close before a word cancels it: "not happy", "not really sad".
+NEGATION_REACH = 3
+
+
+def sentence_emotions(text, with_cues=True):
+    """The emotions a sentence's own words point to, in the order written,
+    skipping negated ones ("I'm not sad, just tired"). Without cues, only
+    words that name an emotion outright ("sad", "scared") count."""
+    tokens = _tokens(text)
+    vocabulary = known_words()
+    normalized = [_normalize_token(token, vocabulary) or token for token in tokens]
+    found = []
+    index = 0
+    last_match_end = 0
+    while index < len(normalized):
+        for phrase, emotions in _sentence_phrase_index(with_cues):
+            if tuple(normalized[index:index + len(phrase)]) == phrase:
+                # A negation reaches back no further than the previous emotion
+                # word: in "not happy, just sad" it cancels only "happy".
+                before = normalized[max(last_match_end, index - NEGATION_REACH):index]
+                if not any(token in NEGATION_WORDS_EN for token in before):
+                    for emotion in emotions:
+                        if emotion not in found:
+                            found.append(emotion)
+                index += len(phrase)
+                last_match_end = index
+                break
+        else:
+            index += 1
+    return found
+
+
+def named_pair_in_sentence(text, model_emotion=None):
+    """(first, second) when the sentence's words name exactly one of the named
+    mixes (EMOTION_PAIR_WORDS_EN), else None. The model's emotion goes first
+    when it is one of the two; otherwise the one written first."""
+    found = sentence_emotions(text)
+    candidates = [
+        pair for pair in EMOTION_PAIR_WORDS_EN
+        if pair[0] in found and pair[1] in found
+    ]
+    if len(candidates) != 1:
+        return None
+    first, second = sorted(candidates[0], key=found.index)
+    if model_emotion == second:
+        first, second = second, first
+    return first, second
+
+
+def _is_named_mix(first, second):
+    return tuple(sorted((first, second))) in EMOTION_PAIR_WORDS_EN
+
+
+def names_unsupported_mix(text, model_emotion=None):
+    """True when the sentence names two or more feelings outright ("I'm angry
+    at him but also scared") and they are not one of the named mixes. Only
+    plain emotion words count here, not cues: "nobody came and I cried" is
+    one sad feeling, not an unsupported mix. The model has to agree it is one
+    of those feelings (or a mix), so a third reading is left alone."""
+    found = [emotion for emotion in sentence_emotions(text, with_cues=False) if emotion != 'mixed']
+    if len(found) < 2:
+        return False
+    if len(found) == 2 and _is_named_mix(*found):
+        return False
+    return model_emotion is None or model_emotion == 'mixed' or model_emotion in found
 
 
 def _match_emoji(text):
@@ -552,9 +724,12 @@ def check_input(text):
     if _is_non_english(tokens, text):
         return InputCheck(STATUS_NON_ENGLISH, 'tagalog_markers')
 
-    emotion = _match_emotion_word(tokens)
-    if emotion:
-        return InputCheck(STATUS_OK, 'emotion_word', emotion, ROUTE_EMOTION_WORD)
+    emotions = _match_emotion_words(tokens)
+    if emotions:
+        return InputCheck(
+            STATUS_OK, 'emotion_word', emotions[0], ROUTE_EMOTION_WORD,
+            second_emotion=emotions[1] if len(emotions) == 2 else None,
+        )
 
     vocabulary = known_words()
     normalized = [_normalize_token(token, vocabulary) or token for token in tokens]
@@ -595,6 +770,10 @@ def check_input(text):
 MIN_MODEL_CONFIDENCE = 0.40
 MIN_MODEL_MARGIN = 0.10
 MIN_MODEL_CONFIDENCE_WITHOUT_AFFECT = 0.99
+# A runner-up this strong is a second feeling, not noise ("nobody texted me
+# back all weekend" -> sad 0.59, lonely 0.30). BERT is peaky: on the eval rows
+# most runners-up are under 0.10, so 0.30 only fires on real two-way splits.
+MIN_SECOND_EMOTION_CONFIDENCE = 0.30
 # Fallback sources mean BERT itself was below its own medium threshold.
 TRUSTED_SOURCES = ('bert', 'goemotions')
 
@@ -613,7 +792,27 @@ def model_result_is_unclear(result, check):
     margin = float(result.get('confidence_margin') or 0.0)
     if check is not None and not check.has_affect:
         return confidence < MIN_MODEL_CONFIDENCE_WITHOUT_AFFECT
-    return confidence < MIN_MODEL_CONFIDENCE or margin < MIN_MODEL_MARGIN
+    if confidence < MIN_MODEL_CONFIDENCE:
+        return True
+    # A near tie between two strong emotions that form a named mix is that
+    # mix, not a guess.
+    second = second_model_emotion(result)
+    is_named_mix = bool(second) and _is_named_mix(result.get('emotion'), second)
+    return margin < MIN_MODEL_MARGIN and not is_named_mix
+
+
+def second_model_emotion(result):
+    """The classifier's runner-up when it is strong enough to count as a second
+    feeling, else None. Never "mixed": that list already is the blend."""
+    top = (result or {}).get('top_emotions') or []
+    if len(top) < 2:
+        return None
+    first, second = top[0], top[1]
+    if 'mixed' in (first.get('emotion'), second.get('emotion')):
+        return None
+    if float(second.get('confidence') or 0.0) < MIN_SECOND_EMOTION_CONFIDENCE:
+        return None
+    return second.get('emotion')
 
 
 @dataclass(frozen=True)
@@ -626,6 +825,7 @@ class Decision:
     route: str | None = None
     emotion: str | None = None
     result: dict | None = None
+    second_emotion: str | None = None
 
 
 def decide_after_crisis(text, predict):
@@ -641,10 +841,53 @@ def decide_after_crisis(text, predict):
     if check is not None and check.status not in (STATUS_OK, 'pass'):
         return Decision(check.status, check.reason)
     if check is not None and check.route == ROUTE_EMOTION_WORD:
-        return Decision(STATUS_OK, check.reason, ROUTE_EMOTION_WORD, check.emotion)
+        if check.second_emotion and not _is_named_mix(check.emotion, check.second_emotion):
+            return Decision(STATUS_UNSUPPORTED_MIX, 'two_words_not_a_named_mix')
+        return Decision(
+            STATUS_OK, check.reason, ROUTE_EMOTION_WORD, check.emotion,
+            second_emotion=check.second_emotion,
+        )
 
     result = predict(text)
     if check is not None and model_result_is_unclear(result, check):
         return Decision(STATUS_UNCLEAR, 'low_model_confidence', result=result)
-    reason = 'concern_guard' if check is None else 'model'
-    return Decision(STATUS_OK, reason, ROUTE_MODEL, result.get('emotion'), result)
+    if check is None:
+        # Concern-tier text keeps the single emotion it always had.
+        return Decision(STATUS_OK, 'concern_guard', ROUTE_MODEL, result.get('emotion'), result)
+    # A model trained on the mix schema names the mix itself ("bittersweet").
+    mix_label = result.get('mix_label') if isinstance(result, dict) else None
+    if mix_label:
+        first, second = (result.get('top_emotions') or [{}, {}])[:2]
+        if first.get('emotion') and second.get('emotion'):
+            return Decision(
+                STATUS_OK, 'model_mix_label', ROUTE_MODEL, first['emotion'], result,
+                second_emotion=second['emotion'],
+            )
+    # BERT gives one label, and for a sentence with two feelings it often says
+    # "mixed" ("I'm happy I graduated but sad to leave my friends" -> mixed
+    # 84%). When the sentence's own words name one of the named mixes, use it,
+    # unless the model read some third emotion.
+    model_emotion = result.get('emotion') if isinstance(result, dict) else None
+    pair = named_pair_in_sentence(text, model_emotion)
+    if pair and (model_emotion in ('mixed', *pair) or model_result_is_unclear(result, check)):
+        first, second = pair
+        return Decision(
+            STATUS_OK, 'sentence_mix_words', ROUTE_MODEL, first,
+            {**(result or {}), 'emotion': first, 'prediction_strategy': 'sentence_mix_words'},
+            second_emotion=second,
+        )
+    if names_unsupported_mix(text, model_emotion):
+        return Decision(STATUS_UNSUPPORTED_MIX, 'sentence_names_unsupported_mix', result=result)
+    if model_emotion == 'mixed' and result.get('prediction_strategy') != 'system_fallback':
+        # The general "mixed" list is gone (split into the named mixes), so a
+        # "mixed" reading that no named mix explains is not supported.
+        return Decision(STATUS_UNSUPPORTED_MIX, 'model_mixed_no_named_mix', result=result)
+    second = None
+    if result.get('prediction_source') in TRUSTED_SOURCES:
+        second = second_model_emotion(result)
+        if second and not _is_named_mix(model_emotion, second):
+            # A strong runner-up that is no named mix: keep the main feeling.
+            second = None
+    return Decision(
+        STATUS_OK, 'model', ROUTE_MODEL, result.get('emotion'), result, second_emotion=second,
+    )
