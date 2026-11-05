@@ -717,8 +717,9 @@ class AnalyzeEmotionTests(TestCase):
         self.assertEqual(body['total'], 10)
         self.assertEqual([t['position'] for t in body['tracks']], list(range(1, 11)))
         self.assertTrue(all(t['recommendation_source'] == 'therapist_list' for t in body['tracks']))
-        # Owner correction 2026-10-10: no longer approved for Depressed.
-        self.assertNotIn('Innocence', [t['name'] for t in body['tracks']])
+        # The 2026-11-06 docs/music.md (therapist-approved) lists "Innocence"
+        # under Depressed again, reversing the 2026-10-10 correction in 0008.
+        self.assertIn('Innocence', [t['name'] for t in body['tracks']])
 
     def test_no_song_from_another_emotion_is_returned(self):
         body = self._analyze('happy').json()
@@ -726,13 +727,13 @@ class AnalyzeEmotionTests(TestCase):
         self.assertEqual(set(t['name'] for t in body['tracks']), set(_approved_titles('happy')))
 
     def test_a_matched_song_carries_what_in_app_playback_needs(self):
-        track = next(t for t in self._analyze('motivational').json()['tracks'] if t['name'] == 'Graduation March')
+        track = next(t for t in self._analyze('motivational').json()['tracks'] if t['name'] == 'Titanium')
 
-        self.assertEqual(track['artist'], 'Holiday Celebration Troupe')
+        self.assertEqual(track['artist'], 'David Guetta ft. Sia')
         self.assertTrue(track['playable'])
-        self.assertEqual(track['id'], '1uaFfBstndFSw4vntlb1k7')
-        self.assertEqual(track['uri'], 'spotify:track:1uaFfBstndFSw4vntlb1k7')
-        self.assertEqual(track['spotify_url'], 'https://open.spotify.com/track/1uaFfBstndFSw4vntlb1k7')
+        self.assertEqual(track['id'], '0TDLuuLlV54CkRRUOahJb4')
+        self.assertEqual(track['uri'], 'spotify:track:0TDLuuLlV54CkRRUOahJb4')
+        self.assertEqual(track['spotify_url'], 'https://open.spotify.com/track/0TDLuuLlV54CkRRUOahJb4')
 
     def test_an_unmatched_song_is_listed_with_a_search_link_but_not_playable(self):
         link = EmotionSong.objects.filter(song__spotify_track_id__isnull=True).select_related('emotion', 'song').first()
@@ -756,10 +757,13 @@ class AnalyzeEmotionTests(TestCase):
         self.assertNotIn(first.title, [t['name'] for t in body['tracks']])
 
     def test_a_song_approved_for_several_emotions_appears_once_in_each(self):
-        for emotion in ('depressing', 'calm', 'stressed'):
+        # Ed Sheeran's "Photograph" is approved for three emotions.
+        for emotion in ('nostalgic', 'romantic', 'calm'):
             with self.subTest(emotion=emotion):
-                names = [t['name'] for t in self._analyze(emotion).json()['tracks']]
-                self.assertEqual(names.count('Leaves'), 1)
+                tracks = self._analyze(emotion).json()['tracks']
+                self.assertEqual(
+                    [(t['name'], t['artist']) for t in tracks].count(('Photograph', 'Ed Sheeran')), 1,
+                )
 
     def test_an_emotion_with_no_songs_returns_an_empty_list_and_a_message(self):
         EmotionSong.objects.filter(emotion__name='calm').delete()
