@@ -69,7 +69,7 @@ Hurt – Johnny Cash
 How to Save a Life – The Fray
 Somebody Else – The 1975
 Everybody Hurts – R.E.M.
-Pahinga – Ben&Ben
+Magpahinga – Ben&Ben
 Heavy – Linkin Park ft. Kiiara
 Innocence – Hildir Svensson and deprezz
 Numb – Linkin Park
